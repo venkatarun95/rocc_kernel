@@ -15,8 +15,9 @@ static const u16 rocc_num_intervals = 16;
 static const u16 rocc_num_intervals_mask = 15;
 static const u32 rocc_min_cwnd = 2;
 // Maximum tolerable loss rate, expressed as `loss_thresh / 1024`. Calculations
-// are faster if things are powers of 2
-static const u32 loss_thresh = 8;
+// are faster if things are powers of 64
+static const u64 rocc_loss_thresh = 64;
+static const u32 rocc_alpha = 2;
 
 enum ROCC_MODE {
 	ROCC_REGULAR_MODE,
@@ -90,6 +91,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	// Number of packets acked and lost in the last `hist_us`
 	u32 pkts_acked, pkts_lost;
 	u32 cwnd;
+	bool loss_mode;
 
 	if (!rocc_valid(rocc))
 		return;
@@ -98,9 +100,9 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	if (rs->delivered < 0 || rs->interval_us < 0)
 		return;
 
-	/* Get initial RTT - as measured by SYN -> SYN-ACK.
-         * If information does not exist - use U32_MAX as RTT
-         */
+	// Get initial RTT - as measured by SYN -> SYN-ACK.  If information
+        // does not exist - use U32_MAX as RTT
+
 	if (tsk->srtt_us) {
 		rtt_us = max(tsk->srtt_us >> 3, 1U);
 	} else {
@@ -144,22 +146,37 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		}
 	}
 
-	// If the loss rate was too high, reduce the cwnd
-	if (pkts_lost > (pkts_acked + pkts_lost)
-
-	cwnd = pkts_acked;
+	// Set cwnd
+	cwnd = pkts_acked + rocc_alpha;
 	if (cwnd < rocc_min_cwnd) {
 		cwnd = rocc_min_cwnd;
 	}
 	tsk->snd_cwnd = cwnd;
 
+	// Set pacing according to cwnd and whether there was excessive
+	// loss. Note, this stuff isn't CCAC approved (yet)
+	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
+	if (loss_mode) {
+		// If the loss rate was too high, reduce the pacing rate. Do
+		// division at the end to minimize error due to
+		// integers. Further, do all computations in u64.
+		sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) * (1024 + 2 * rocc_loss_thresh) / (rtt_us * 2 * 1024);
+	}
+	else {
+		// No loss, send normal pacing rate. We use min_rtt just to be
+		// pace a little extra because we want to be cwnd
+		// limited. Doing that in loss_mode can be dangerous if min_rtt
+		// is an underestimate
+		sk->sk_pacing_rate = 1000000 * (u64) cwnd * rocc_get_mss(tsk) / rocc->min_rtt_us;
+	}
+
 #ifdef ROCC_DEBUG
 	printk(KERN_INFO "rocc cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
-	printk(KERN_INFO "rocc pkts_acked %u hist_us %u", pkts_acked, hist_us);
-	for (i = 0; i < rocc_num_intervals; ++i) {
-		id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
-		printk(KERN_INFO "rocc intervals %llu acked %u lost %u i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, i, id);
-	}
+	printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_mode %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)loss_mode);
+	/* for (i = 0; i < rocc_num_intervals; ++i) { */
+	/* 	id = (rocc->intervals_head + i) & rocc_num_intervals_mask; */
+	/* 	printk(KERN_INFO "rocc intervals %llu acked %u lost %u i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, i, id); */
+	/* } */
 #endif
 
 	if (rocc->mode == ROCC_LOSS_MODE)
@@ -173,6 +190,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 static void rocc_release(struct sock *sk)
 {
 	struct rocc_data *rocc = inet_csk_ca(sk);
+	kfree(rocc->intervals);
 }
 
 /* ROCC does not need to undo the cwnd since it does not
@@ -190,11 +208,11 @@ static u32 rocc_ssthresh(struct sock *sk)
 
 static void rocc_set_state(struct sock *sk, u8 new_state)
 {
-	struct rocc_data *rocc = inet_csk_ca(sk);
-	struct tcp_sock *tsk = tcp_sk(sk);
+	/* struct rocc_data *rocc = inet_csk_ca(sk); */
+	/* struct tcp_sock *tsk = tcp_sk(sk); */
 
-	if (!rocc_valid(rocc))
-		return;
+	/* if (!rocc_valid(rocc)) */
+	/* 	return; */
 
 	/* In Loss state, the counters of sent segs versus segs recived, lost
 	 * and in flight, stops being in sync. So at the end of the loss state,
