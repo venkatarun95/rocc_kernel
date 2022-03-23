@@ -1,5 +1,4 @@
-/* RoCC (Robust Congestion Control
- * For debugging use `sudo sysctl -w net.ipv4.tcp_fin_timeout=1` so you can `rmmod` the module sooner, else it will wait for 60 seconds
+/* RoCC (Robust Congestion Control)
  */
 
 #include <linux/module.h>
@@ -7,7 +6,7 @@
 #include <net/tcp.h>
 #include <linux/random.h>
 
-#define ROCC_DEBUG
+#undef ROCC_DEBUG
 
 // Should be a power of two so rocc_num_intervals_mask can be set
 static const u16 rocc_num_intervals = 16;
@@ -18,11 +17,6 @@ static const u32 rocc_min_cwnd = 2;
 // are faster if things are powers of 64
 static const u64 rocc_loss_thresh = 64;
 static const u32 rocc_alpha = 2;
-
-enum ROCC_MODE {
-	ROCC_REGULAR_MODE,
-	ROCC_LOSS_MODE
-};
 
 // To keep track of the number of packets acked over a short period of time
 struct rocc_interval {
@@ -39,7 +33,6 @@ struct rocc_data {
 	u16 intervals_head;
 
 	u32 min_rtt_us;
-	enum ROCC_MODE mode;
 
 	// debug helpers
 	int id;
@@ -60,7 +53,6 @@ static void rocc_init(struct sock *sk)
 	rocc->intervals_head = 0;
 
 	rocc->min_rtt_us = U32_MAX;
-	rocc->mode = ROCC_REGULAR_MODE;
 	++id;
 	rocc->id = id;
 
@@ -178,13 +170,6 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	/* 	printk(KERN_INFO "rocc intervals %llu acked %u lost %u i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, i, id); */
 	/* } */
 #endif
-
-	if (rocc->mode == ROCC_LOSS_MODE)
-		goto end;
-
- end:;
-	//pcc->lost_base = tsk->lost;
-	//pcc->delivered_base = tsk->delivered;
 }
 
 static void rocc_release(struct sock *sk)
@@ -206,55 +191,7 @@ static u32 rocc_ssthresh(struct sock *sk)
 	return TCP_INFINITE_SSTHRESH; /* ROCC does not use ssthresh */
 }
 
-static void rocc_set_state(struct sock *sk, u8 new_state)
-{
-	/* struct rocc_data *rocc = inet_csk_ca(sk); */
-	/* struct tcp_sock *tsk = tcp_sk(sk); */
-
-	/* if (!rocc_valid(rocc)) */
-	/* 	return; */
-
-	/* In Loss state, the counters of sent segs versus segs recived, lost
-	 * and in flight, stops being in sync. So at the end of the loss state,
-	 * pcc saves the diff between the counters in order to resulves these
-	 * diffs in the future
-	 */
-	/* if (pcc->mode == PCC_LOSS && new_state != TCP_CA_Loss) { */
-	/* 	double_counted = tsk->delivered + tsk->lost+ */
-	/* 			 tcp_packets_in_flight(tsk); */
-	/* 	double_counted -= tsk->data_segs_out; */
-	/* 	double_counted -= pcc->double_counted; */
-	/* 	pcc->double_counted+= double_counted; */
-	/* 	printk(KERN_INFO "%d loss ended: double_counted %d\n", */
-	/* 	       pcc->id, double_counted); */
-
-	/* 	pcc->mode = PCC_DECISION_MAKING; */
-	/* 	pcc_setup_intervals(pcc); */
-	/* 	pcc_start_interval(sk, pcc); */
-	/* } else if (pcc->mode != PCC_LOSS && new_state  == TCP_CA_Loss) { */
-	/* 	printk(KERN_INFO "%d loss: started\n", pcc->id); */
-	/* 	pcc->mode = PCC_LOSS; */
-	/* 	pcc->wait_mode = true; */
-	/* 	pcc_start_interval(sk, pcc); */
-	/* } else { */
-	/* 	pcc_set_cwnd(sk); */
-	/* } */
-}
-
 static void rocc_cong_avoid(struct sock *sk, u32 ack, u32 acked)
-{
-}
-
-static void rocc_pkts_acked(struct sock *sk, const struct ack_sample *acks)
-{
-}
-static void rocc_ack_event(struct sock *sk, u32 flags)
-{
-
-}
-
-
-static void rocc_cwnd_event(struct sock *sk, enum tcp_ca_event event)
 {
 }
 
@@ -269,11 +206,7 @@ static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 	.undo_cwnd = rocc_undo_cwnd,
 	/* Slow start threshold will not exist */
 	 .ssthresh = rocc_ssthresh,
-	//.set_state	= rocc_set_state,
 	.cong_avoid = rocc_cong_avoid,
-	//.pkts_acked = rocc_pkts_acked,
-	//.in_ack_event= rocc_ack_event,
-	//.cwnd_event	= rocc_cwnd_event,
 };
 
 /* Kernel module section */
@@ -281,7 +214,9 @@ static struct tcp_congestion_ops tcp_rocc_cong_ops __read_mostly = {
 static int __init rocc_register(void)
 {
 	BUILD_BUG_ON(sizeof(struct rocc_data) > ICSK_CA_PRIV_SIZE);
+#ifdef ROCC_DEBUG
 	printk(KERN_INFO "rocc init reg\n");
+#endif
 	return tcp_register_congestion_control(&tcp_rocc_cong_ops);
 }
 
