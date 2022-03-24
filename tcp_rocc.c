@@ -24,6 +24,7 @@ struct rocc_interval {
 	u64 start_us;
 	u32 pkts_acked;
 	u32 pkts_lost;
+	bool app_limited;
 };
 
 static int id = 0;
@@ -49,6 +50,7 @@ static void rocc_init(struct sock *sk)
 		rocc->intervals[i].start_us = 0;
 		rocc->intervals[i].pkts_acked = 0;
 		rocc->intervals[i].pkts_lost = 0;
+		rocc->intervals[i].app_limited = false;
 	}
 	rocc->intervals_head = 0;
 
@@ -83,7 +85,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	// Number of packets acked and lost in the last `hist_us`
 	u32 pkts_acked, pkts_lost;
 	u32 cwnd;
-	bool loss_mode;
+	bool loss_mode, app_limited;
 
 	if (!rocc_valid(rocc))
 		return;
@@ -94,7 +96,6 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 
 	// Get initial RTT - as measured by SYN -> SYN-ACK.  If information
         // does not exist - use U32_MAX as RTT
-
 	if (tsk->srtt_us) {
 		rtt_us = max(tsk->srtt_us >> 3, 1U);
 	} else {
@@ -120,19 +121,23 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 		rocc->intervals[rocc->intervals_head].start_us = timestamp;
 		rocc->intervals[rocc->intervals_head].pkts_acked = rs->acked_sacked;
 		rocc->intervals[rocc->intervals_head].pkts_lost = rs->losses;
+		rocc->intervals[rocc->intervals_head].app_limited = rs->is_app_limited;
 	}
 	else {
 		rocc->intervals[rocc->intervals_head].pkts_acked += rs->acked_sacked;
 		rocc->intervals[rocc->intervals_head].pkts_lost += rs->losses;
+		rocc->intervals[rocc->intervals_head].app_limited |= rs->is_app_limited;
 	}
 
 	// Find the statistics from the last `hist` seconds
 	pkts_acked = 0;
 	pkts_lost = 0;
+	app_limited = false;
 	for (i = 0; i < rocc_num_intervals; ++i) {
 		id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
 		pkts_acked += rocc->intervals[id].pkts_acked;
 		pkts_lost += rocc->intervals[id].pkts_lost;
+		app_limited |= rocc->intervals[id].app_limited;
 		if (rocc->intervals[id].start_us + hist_us < timestamp) {
 			break;
 		}
@@ -140,6 +145,9 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 
 	// Set cwnd
 	cwnd = pkts_acked + rocc_alpha;
+	if (app_limited && cwnd < tsk->snd_cwnd) {
+		cwnd = tsk->snd_cwnd;
+	}
 	if (cwnd < rocc_min_cwnd) {
 		cwnd = rocc_min_cwnd;
 	}
@@ -164,11 +172,11 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 
 #ifdef ROCC_DEBUG
 	printk(KERN_INFO "rocc cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
-	printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_mode %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)loss_mode);
-	/* for (i = 0; i < rocc_num_intervals; ++i) { */
-	/* 	id = (rocc->intervals_head + i) & rocc_num_intervals_mask; */
-	/* 	printk(KERN_INFO "rocc intervals %llu acked %u lost %u i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, i, id); */
-	/* } */
+	printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_mode %d app_limited %d rs_limited %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)loss_mode, (int)app_limited, (int)rs->is_app_limited);
+	for (i = 0; i < rocc_num_intervals; ++i) {
+		id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
+		printk(KERN_INFO "rocc intervals %llu acked %u lost %u app_limited %d i %u id %u", rocc->intervals[id].start_us, rocc->intervals[id].pkts_acked, rocc->intervals[id].pkts_lost, (int)rocc->intervals[id].app_limited, i, id);
+	}
 #endif
 }
 
