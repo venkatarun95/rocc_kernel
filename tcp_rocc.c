@@ -1,20 +1,18 @@
 /* RoCC (Robust Congestion Control)
  */
 
-#include <linux/module.h>
-#include <linux/kernel.h>
 #include <net/tcp.h>
-#include <linux/random.h>
 
 #undef ROCC_DEBUG
 
 // Should be a power of two so rocc_num_intervals_mask can be set
 static const u16 rocc_num_intervals = 16;
-// rocc_num_intervals expressed as a mask
+// rocc_num_intervals expressed as a mask. It is always equal to
+// rocc_num_intervals-1
 static const u16 rocc_num_intervals_mask = 15;
 static const u32 rocc_min_cwnd = 2;
 // Maximum tolerable loss rate, expressed as `loss_thresh / 1024`. Calculations
-// are faster if things are powers of 64
+// are faster if things are powers of 2
 static const u64 rocc_loss_thresh = 64;
 static const u32 rocc_alpha = 2;
 
@@ -27,16 +25,17 @@ struct rocc_interval {
 	bool app_limited;
 };
 
-static int id = 0;
+static u32 id = 0;
 struct rocc_data {
+	// Circular queue of intervals
 	struct rocc_interval *intervals;
 	// Index of the last interval to be added
 	u16 intervals_head;
 
 	u32 min_rtt_us;
 
-	// debug helpers
-	int id;
+	// debug helper
+	u32 id;
 };
 
 static void rocc_init(struct sock *sk)
@@ -105,11 +104,13 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	if (rtt_us < rocc->min_rtt_us)
 		rocc->min_rtt_us = rtt_us;
 
-	hist_us = 2 * rocc->min_rtt_us;
+	if (rocc->min_rtt_us == U32_MAX)
+		hist_us = U32_MAX;
+	else
+		hist_us = 2 * rocc->min_rtt_us;
 
 	// Update intervals
 	timestamp = tsk->tcp_mstamp; // Most recent send/receive
-	//timestamp = rs->prior_mstamp + rs->interval_us;
 
 	// The factor of 2 gives some headroom so that we always have
 	// sufficient history. We end up storing more history than needed, but
@@ -146,6 +147,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	// Set cwnd
 	cwnd = pkts_acked + rocc_alpha;
 	if (app_limited && cwnd < tsk->snd_cwnd) {
+		// Do not decrease cwnd if app limited
 		cwnd = tsk->snd_cwnd;
 	}
 	if (cwnd < rocc_min_cwnd) {
@@ -154,7 +156,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	tsk->snd_cwnd = cwnd;
 
 	// Set pacing according to cwnd and whether there was excessive
-	// loss. Note, this stuff isn't CCAC approved (yet)
+	// loss. Note, this stuff isn't CCAC approved (yet).
 	loss_mode = (u64) pkts_lost * 1024 > (u64) (pkts_acked + pkts_lost) * rocc_loss_thresh;
 	if (loss_mode) {
 		// If the loss rate was too high, reduce the pacing rate. Do
@@ -171,7 +173,7 @@ static void rocc_process_sample(struct sock *sk, const struct rate_sample *rs)
 	}
 
 #ifdef ROCC_DEBUG
-	printk(KERN_INFO "rocc cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
+	printk(KERN_INFO "rocc flow %u cwnd %u pacing %lu rtt %u mss %u timestamp %llu interval %ld", rocc->id, tsk->snd_cwnd, sk->sk_pacing_rate, rtt_us, tsk->mss_cache, timestamp, rs->interval_us);
 	printk(KERN_INFO "rocc pkts_acked %u hist_us %u pacing %lu loss_mode %d app_limited %d rs_limited %d", pkts_acked, hist_us, sk->sk_pacing_rate, (int)loss_mode, (int)app_limited, (int)rs->is_app_limited);
 	for (i = 0; i < rocc_num_intervals; ++i) {
 		id = (rocc->intervals_head + i) & rocc_num_intervals_mask;
